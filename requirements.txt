@@ -1,0 +1,108 @@
+"""
+custom_transformers.py
+
+Berisi semua custom scikit-learn transformer yang dipakai di pipeline zero-leakage
+(notebook riset & aplikasi Streamlit). WAJIB diimpor dari file ini di KEDUA sisi
+(notebook training dan app.py), karena joblib/pickle menyimpan referensi
+"module.ClassName", bukan isi class-nya. Kalau class didefinisikan langsung di
+notebook (__main__), file lain (app.py) tidak akan bisa menemukan class itu saat
+unpickle -> AttributeError: Can't get attribute 'X' on module '__main__'.
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+
+
+class MedianImputer(BaseEstimator, TransformerMixin):
+    def fit(self, X, y=None):
+        X = pd.DataFrame(X)
+        self.columns_ = X.columns
+        self.medians_ = X.median()
+        return self
+
+    def transform(self, X):
+        X = pd.DataFrame(np.asarray(X), columns=self.columns_)
+        return X.fillna(self.medians_)
+
+
+class IQRCapper(BaseEstimator, TransformerMixin):
+    def __init__(self, factor=1.5):
+        self.factor = factor
+
+    def fit(self, X, y=None):
+        X = pd.DataFrame(X)
+        self.columns_ = X.columns
+        self.lower_bounds_, self.upper_bounds_ = {}, {}
+        for col in X.columns:
+            Q1, Q3 = X[col].quantile(0.25), X[col].quantile(0.75)
+            IQR = Q3 - Q1
+            self.lower_bounds_[col] = Q1 - self.factor * IQR
+            self.upper_bounds_[col] = Q3 + self.factor * IQR
+        return self
+
+    def transform(self, X):
+        X = pd.DataFrame(np.asarray(X), columns=self.columns_).copy()
+        for col in self.columns_:
+            X[col] = np.clip(X[col], self.lower_bounds_[col], self.upper_bounds_[col])
+        return X
+
+
+class CorrelationFilter(BaseEstimator, TransformerMixin):
+    def __init__(self, threshold=0.95):
+        self.threshold = threshold
+
+    def fit(self, X, y=None):
+        X = pd.DataFrame(X)
+        self.columns_ = X.columns
+        corr_matrix = X.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        self.to_drop_ = [col for col in upper.columns if any(upper[col] > self.threshold)]
+        self.kept_columns_ = [c for c in X.columns if c not in self.to_drop_]
+        return self
+
+    def transform(self, X):
+        X = pd.DataFrame(np.asarray(X), columns=self.columns_)
+        return X[self.kept_columns_]
+
+
+class ImportanceSelector(BaseEstimator, TransformerMixin):
+    """Feature selection berbasis cumulative permutation importance, fit HANYA di data train."""
+
+    def __init__(self, cum_threshold=0.90, n_estimators=200, n_repeats=5, random_state=42):
+        self.cum_threshold = cum_threshold
+        self.n_estimators = n_estimators
+        self.n_repeats = n_repeats
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        X = pd.DataFrame(X)
+        self.columns_ = X.columns
+
+        screener = RandomForestClassifier(
+            n_estimators=self.n_estimators, random_state=self.random_state, n_jobs=-1
+        )
+        screener.fit(X, y)
+
+        perm = permutation_importance(
+            screener, X, y, n_repeats=self.n_repeats,
+            random_state=self.random_state, n_jobs=-1, scoring='recall'
+        )
+        importances = pd.Series(perm.importances_mean, index=X.columns).clip(lower=0)
+        importances_sorted = importances.sort_values(ascending=False)
+
+        total = importances_sorted.sum()
+        cum_importance = (importances_sorted / total).cumsum()
+        self.selected_columns_ = cum_importance[cum_importance <= self.cum_threshold].index.tolist()
+        if len(self.selected_columns_) < 1:
+            self.selected_columns_ = [importances_sorted.index[0]]
+
+        self.importances_sorted_ = importances_sorted
+        self.cum_importance_ = cum_importance
+        return self
+
+    def transform(self, X):
+        X = pd.DataFrame(np.asarray(X), columns=self.columns_)
+        return X[self.selected_columns_]
